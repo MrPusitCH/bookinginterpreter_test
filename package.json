@@ -85,5 +85,8 @@
     "tsx": "^4.20.5",
     "tw-animate-css": "^1.3.5",
     "typescript": "^5"
+  },
+  "optionalDependencies": {
+    "@next/swc-linux-x64-musl": "^15.5.4"
   }
 }
