@@ -93,7 +93,7 @@ export async function POST(request: NextRequest) {
     
     // Validate policy if provided
     let policyValidation = null;
-    let priorityValidations: any[] = [];
+    const priorityValidations: any[] = [];
     
     if (body.policy) {
       policyValidation = validateAssignmentPolicy(body.policy, currentPolicy);
@@ -182,7 +182,7 @@ export async function POST(request: NextRequest) {
       );
       
       let changedCount = 0;
-      let updatedPriorities: string[] = [];
+      const updatedPriorities: string[] = [];
       
       for (let i = 0; i < body.priorities.length; i++) {
         const priority = body.priorities[i];
