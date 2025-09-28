@@ -1,8 +1,8 @@
 export const BUSINESS_HOURS_START = 8; // 08:00
-export const BUSINESS_HOURS_END = 17; // 17:00 (exclusive for starts)
+export const BUSINESS_HOURS_END = 21; // 21:00 (exclusive for starts)
 export const SLOT_STEP_MINUTES = 30; // minutes
 export const START_OF_DAY = "08:00";
-export const END_OF_DAY = "17:00"; // allowed as end time only
+export const END_OF_DAY = "21:00"; // allowed as end time only
 
 export const VALID_START_SLOTS: readonly string[] = (() => {
   const slots: string[] = [];
@@ -75,7 +75,15 @@ export const isValidYmdHms = (s: string): boolean => {
 
 // Small shared helpers for string-based formatting
 export const extractHHMM = (dateTimeStr: string): string => {
-  const t = dateTimeStr.includes("T") ? dateTimeStr.split("T")[1] : dateTimeStr.split(" ")[1] || "";
+  // If ISO string is provided, format using local timezone
+  if (typeof dateTimeStr === "string" && dateTimeStr.includes("T")) {
+    const d = new Date(dateTimeStr);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+  }
+  // Fallback for legacy 'YYYY-MM-DD HH:mm:ss'
+  const t = dateTimeStr.split(" ")[1] || "";
   return t.slice(0, 5);
 };
 

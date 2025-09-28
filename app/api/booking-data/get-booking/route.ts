@@ -1,26 +1,27 @@
   // NOTE: Protected by middleware via cookie session
   // app/api/bookings/route.ts
-  import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
   import prisma from "@/prisma/prisma";
   import { cookies } from "next/headers";
   import { SESSION_COOKIE_NAME, verifySessionCookieValue } from "@/lib/auth/session";
   import { centerPart } from "@/utils/users";
+export const runtime = "nodejs";
 
-  export const dynamic = "force-dynamic";
+export const dynamic = "force-dynamic";
 
   // Pure string extraction using ISO; avoid timezone math entirely
   const extractYMD = (iso: string) => iso.split("T")[0];
   const extractHHMM = (iso: string) => iso.split("T")[1].slice(0, 5);
 
-  // 'approve'|'cancel'|'waiting'|'complet' -> 'Approve'|'Cancel'|'Wait'|'Complete'
-  const mapStatus = (
-    s: "approve" | "cancel" | "waiting" | "complet"
-  ): "Approve" | "Cancel" | "Wait" | "Complete" => {
-    if (s === "approve") return "Approve";
-    if (s === "cancel") return "Cancel";
-    if (s === "waiting") return "Wait";
-    return "Complete";
-  };
+// 'approve'|'cancel'|'waiting'|'complet' -> 'Approve'|'Cancel'|'Wait'|'Complete'
+const mapStatus = (
+  s: "approve" | "cancel" | "waiting" | "complet"
+): "Approve" | "Cancel" | "Wait" | "Complete" => {
+  if (s === "approve") return "Approve";
+  if (s === "cancel") return "Cancel";
+  if (s === "waiting") return "Wait";
+  return "Complete";
+};
 
   export async function GET(req: Request) {
     // Auth: only ADMIN or SUPER_ADMIN can access
@@ -31,7 +32,7 @@
 
     const me = await prisma.employee.findUnique({
       where: { empCode: parsed.empCode },
-      include: { userRoles: true, adminVisions: true },
+      include: { userRoles: true },
     });
     const roles = me?.userRoles?.map(r => r.roleCode) ?? [];
     const isSuper = roles.includes("SUPER_ADMIN");
@@ -39,7 +40,33 @@
     if (!isAdmin) return NextResponse.json({ error: "FORBIDDEN" }, { status: 403 });
 
     const myCenter = centerPart(me?.deptPath ?? null);
-    const adminCenters = (me?.adminVisions ?? []).map(v => centerPart(v.deptPath)).filter((x): x is string => Boolean(x));
+    // Admin env centers (union)
+    let adminEnvCenters: string[] = [];
+    let adminEnvInterpreterCodes: string[] = [];
+    if (roles.includes("ADMIN") || roles.includes("SUPER_ADMIN")) {
+      const envs = await prisma.environmentAdmin.findMany({
+        where: { adminEmpCode: me!.empCode },
+        select: { environmentId: true, environment: { select: { centers: { select: { center: true } } } } },
+      });
+      adminEnvCenters = envs.flatMap(e => e.environment.centers.map(c => c.center));
+      const envIds = envs.map(e => e.environmentId);
+      if (envIds.length) {
+        const links = await prisma.environmentInterpreter.findMany({ where: { environmentId: { in: envIds } }, select: { interpreterEmpCode: true } });
+        adminEnvInterpreterCodes = links.map(l => l.interpreterEmpCode);
+      }
+    }
+    // User env centers
+    let userEnvCenters: string[] = [];
+    let userEnvInterpreterCodes: string[] = [];
+    if (myCenter) {
+      const envCenter = await prisma.environmentCenter.findUnique({ where: { center: myCenter } });
+      if (envCenter) {
+        const env = await prisma.environment.findUnique({ where: { id: envCenter.environmentId }, select: { centers: { select: { center: true } } } });
+        userEnvCenters = env?.centers.map(c => c.center) ?? [];
+        const links = await prisma.environmentInterpreter.findMany({ where: { environmentId: envCenter.environmentId }, select: { interpreterEmpCode: true } });
+        userEnvInterpreterCodes = links.map(l => l.interpreterEmpCode);
+      }
+    }
 
     const url = new URL(req.url);
     const viewRaw = (url.searchParams.get("view") || "").toLowerCase();
@@ -48,8 +75,8 @@
     const rows = await prisma.bookingPlan.findMany({
       orderBy: { timeStart: "asc" },
       include: {
-        employee: { select: { firstNameEn: true, lastNameEn: true, deptPath: true } },             // เจ้าของ
-        interpreterEmployee: { select: { firstNameEn: true, lastNameEn: true } },  // ล่าม (nullable)
+        employee: { select: { firstNameEn: true, lastNameEn: true, deptPath: true } },
+        interpreterEmployee: { select: { empCode: true, firstNameEn: true, lastNameEn: true } },
       },
     });
 
@@ -58,16 +85,24 @@
     if (isSuper && (view === "admin" || view === "all")) {
       // all
     } else if (view === "admin") {
-      const allow = new Set((adminCenters.length ? adminCenters : (myCenter ? [myCenter] : [])));
+      const allowCenters = new Set((adminEnvCenters.length ? adminEnvCenters : (myCenter ? [myCenter] : [])));
+      const allowInterpreters = new Set(adminEnvInterpreterCodes);
       filtered = rows.filter(b => {
         const c = centerPart(b.employee?.deptPath ?? null);
-        return c ? allow.has(c) : false;
+        // Split out forwarded bookings from admin environment view
+        if (b.isForwarded) return false;
+        const inCenters = c ? allowCenters.has(c) : false;
+        const byInterpreter = b.interpreterEmployee?.empCode ? allowInterpreters.has(b.interpreterEmployee.empCode) : false;
+        return inCenters || byInterpreter;
       });
     } else {
-      const cMy = myCenter;
+      const allowCenters = new Set((userEnvCenters.length ? userEnvCenters : (myCenter ? [myCenter] : [])));
+      const allowInterpreters = new Set(userEnvInterpreterCodes);
       filtered = rows.filter(b => {
         const c = centerPart(b.employee?.deptPath ?? null);
-        return cMy && c ? c === cMy : false;
+        const inCenters = c ? allowCenters.has(c) : false;
+        const byInterpreter = b.interpreterEmployee?.empCode ? allowInterpreters.has(b.interpreterEmployee.empCode) : false;
+        return inCenters || byInterpreter;
       });
     }
 
@@ -89,13 +124,15 @@
         // คงไว้เพื่อ compatibility กับโค้ดเดิม
         topic: b.meetingDetail ?? "",
 
-        bookedBy,                                 // ชื่อผู้จอง
-        status: mapStatus(b.bookingStatus),          // 'Approve' | 'Wait' | 'Cancel'
-        startTime: extractHHMM(b.timeStart.toISOString()),          // "HH:mm"
-        endTime: extractHHMM(b.timeEnd.toISOString()),              // "HH:mm"
-        requestedTime: `${extractYMD(b.createdAt.toISOString())} ${extractHHMM(b.createdAt.toISOString())}:00`,
-      };
-    });
+      bookedBy, // ชื่อผู้จอง
+      status: mapStatus(b.bookingStatus), // 'Approve' | 'Wait' | 'Cancel'
+      startTime: extractHHMM(b.timeStart.toISOString()), // "HH:mm"
+      endTime: extractHHMM(b.timeEnd.toISOString()), // "HH:mm"
+      requestedTime: `${extractYMD(b.createdAt.toISOString())} ${extractHHMM(
+        b.createdAt.toISOString()
+      )}:00`,
+    };
+  });
 
-    return NextResponse.json(result);
-  }
+  return NextResponse.json(result);
+}

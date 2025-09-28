@@ -8,11 +8,12 @@ import prisma, {
   RecurrenceType,
   EndType,
   WeekOrder,
-  DRType,
 } from "@/prisma/prisma";
 import type { CreateBookingRequest } from "@/types/booking-requests";
 import type { ApiResponse } from "@/types/api";
 import type { RunResult } from "@/types/assignment";
+import { getEffectivePolicyForEnvironment } from "@/lib/assignment/config/env-policy";
+import { centerPart } from "@/utils/users";
 
 // Interface moved to '@/types/booking-requests'
 
@@ -788,10 +789,15 @@ export async function POST(request: NextRequest) {
             }
           }
 
-        // 2.6) Final safety: interpreter overlap (President only)
-        if (body.meetingType === "President" && body.selectedInterpreterEmpCode) {
-          const sel = body.selectedInterpreterEmpCode.trim();
-          const busyCounts = await tx.$queryRaw<Array<{ cnt: number | bigint }>>`
+          // 2.6) Final safety: interpreter overlap (President only)
+          if (
+            body.meetingType === "President" &&
+            body.selectedInterpreterEmpCode
+          ) {
+            const sel = body.selectedInterpreterEmpCode.trim();
+            const busyCounts = await tx.$queryRaw<
+              Array<{ cnt: number | bigint }>
+            >`
             SELECT COUNT(*) AS cnt
             FROM BOOKING_PLAN
             WHERE INTERPRETER_EMP_CODE = ${sel}
@@ -799,14 +805,17 @@ export async function POST(request: NextRequest) {
               AND (TIME_START < ${timeEnd} AND TIME_END > ${timeStart})
             FOR UPDATE
           `;
-          const busyCnt = busyCounts?.[0]?.cnt != null ? Number(busyCounts[0].cnt) : 0;
-          if (busyCnt > 0) {
-            const conflictRow = await tx.$queryRaw<Array<{
-              bookingId: number | bigint;
-              timeStart: Date;
-              timeEnd: Date;
-              meetingRoom: string;
-            }>>`
+            const busyCnt =
+              busyCounts?.[0]?.cnt != null ? Number(busyCounts[0].cnt) : 0;
+            if (busyCnt > 0) {
+              const conflictRow = await tx.$queryRaw<
+                Array<{
+                  bookingId: number | bigint;
+                  timeStart: Date;
+                  timeEnd: Date;
+                  meetingRoom: string;
+                }>
+              >`
               SELECT BOOKING_ID as bookingId, TIME_START as timeStart, TIME_END as timeEnd, MEETING_ROOM as meetingRoom
               FROM BOOKING_PLAN
               WHERE INTERPRETER_EMP_CODE = ${sel}
@@ -815,30 +824,51 @@ export async function POST(request: NextRequest) {
               LIMIT 1
               FOR UPDATE
             `;
-            const c = conflictRow?.[0];
-            return {
-              success: false as const,
-              status: 409,
-              body: {
-                success: false,
-                error: "Interpreter conflict",
-                message: `Interpreter ${sel} is already booked in this time range`,
-                code: "INTERPRETER_CONFLICT",
-                conflictDetails: c
-                  ? {
-                      bookingId: c.bookingId != null ? Number(c.bookingId) : null,
-                      timeStart: c.timeStart,
-                      timeEnd: c.timeEnd,
-                      meetingRoom: c.meetingRoom,
-                    }
-                  : undefined,
-              },
-            };
+              const c = conflictRow?.[0];
+              return {
+                success: false as const,
+                status: 409,
+                body: {
+                  success: false,
+                  error: "Interpreter conflict",
+                  message: `Interpreter ${sel} is already booked in this time range`,
+                  code: "INTERPRETER_CONFLICT",
+                  conflictDetails: c
+                    ? {
+                        bookingId:
+                          c.bookingId != null ? Number(c.bookingId) : null,
+                        timeStart: c.timeStart,
+                        timeEnd: c.timeEnd,
+                        meetingRoom: c.meetingRoom,
+                      }
+                    : undefined,
+                },
+              };
+            }
           }
-        }
 
-        // 3) Insert parent booking (capacity still enforced by the global lock + check)
-          const isPresident = body.meetingType === "President" && body.selectedInterpreterEmpCode;
+          // 3) Insert parent booking (capacity still enforced by the global lock + check)
+          const isPresident =
+            body.meetingType === "President" && body.selectedInterpreterEmpCode;
+          // Determine environment for policy gate
+          let envId: number | null = null;
+          const owner = await tx.employee.findUnique({
+            where: { empCode: ownerEmpCode },
+            select: { deptPath: true },
+          });
+          const center = centerPart(owner?.deptPath ?? null);
+          if (center) {
+            const envCenter = await tx.environmentCenter.findUnique({
+              where: { center },
+              select: { environmentId: true },
+            });
+            envId = envCenter?.environmentId ?? null;
+          }
+          let allowAutoApprove = true;
+          if (envId != null) {
+            const eff = await getEffectivePolicyForEnvironment(envId);
+            allowAutoApprove = !!eff.autoAssignEnabled;
+          }
           await tx.$executeRaw`
             INSERT INTO BOOKING_PLAN (
               \`OWNER_GROUP\`, \`MEETING_ROOM\`, \`MEETING_DETAIL\`, \`TIME_START\`, \`TIME_END\`, \`BOOKING_STATUS\`, \`created_at\`, \`updated_at\`,
@@ -850,12 +880,16 @@ export async function POST(request: NextRequest) {
               ${body.ownerGroup}, ${body.meetingRoom.trim()}, ${
             body.meetingDetail ?? null
           }, ${timeStart}, ${timeEnd}, ${
-            isPresident ? 'approve' : (body.bookingStatus || BookingStatus.waiting)
+            isPresident && allowAutoApprove
+              ? "approve"
+              : body.bookingStatus || BookingStatus.waiting
           }, NOW(), NOW(),
               ${body.drType ?? null}, ${body.otherType ?? null}, ${
             body.otherTypeScope ?? null
           }, ${body.applicableModel ?? null}, ${
-            isPresident ? body.selectedInterpreterEmpCode : body.interpreterEmpCode ?? null
+            isPresident && allowAutoApprove
+              ? body.selectedInterpreterEmpCode
+              : body.interpreterEmpCode ?? null
           }, ${body.isRecurring ? 1 : 0}, ${
             body.meetingType ?? null
           }, ${ownerEmpCode},
@@ -870,9 +904,7 @@ export async function POST(request: NextRequest) {
           },
               ${body.languageCode ?? null}, ${
             normalizedChairmanEmail ?? null
-          }, ${
-            body.selectedInterpreterEmpCode ?? null
-          },
+          }, ${body.selectedInterpreterEmpCode ?? null},
               '[]'
             )
           `;
@@ -1020,7 +1052,10 @@ export async function POST(request: NextRequest) {
                 meetingRoom: body.meetingRoom.trim(),
                 timeStart,
                 timeEnd,
-                bookingStatus: isPresident ? 'approve' : (body.bookingStatus || BookingStatus.waiting),
+                bookingStatus:
+                  isPresident && allowAutoApprove
+                    ? "approve"
+                    : body.bookingStatus || BookingStatus.waiting,
                 inviteEmailsSaved: Array.isArray(body.inviteEmails)
                   ? body.inviteEmails.length
                   : 0,
@@ -1126,6 +1161,71 @@ export async function POST(request: NextRequest) {
         if (result.body.data) {
           result.body.data.autoAssignment =
             autoAssignmentResult as RunResult | null;
+
+          // If auto-assign escalated (no interpreter), compute forward suggestion for UI
+          if (
+            autoAssignmentResult &&
+            autoAssignmentResult.status !== "assigned"
+          ) {
+            try {
+              const savedId = result.body.data.bookingId as number;
+              // Find user's environment by owner center
+              const bk = await prisma.bookingPlan.findUnique({
+                where: { bookingId: savedId },
+                select: {
+                  timeStart: true,
+                  timeEnd: true,
+                  meetingType: true,
+                  employee: { select: { deptPath: true } },
+                },
+              });
+              let environmentId: number | null = null;
+              if (bk?.employee?.deptPath) {
+                const c = centerPart(bk.employee.deptPath);
+                if (c) {
+                  const envC = await prisma.environmentCenter.findUnique({
+                    where: { center: c },
+                    select: { environmentId: true },
+                  });
+                  environmentId = envC?.environmentId ?? null;
+                }
+              }
+
+              // Capacity full in user's environment
+              let capacityFull = false;
+              if (environmentId != null && bk?.timeStart && bk?.timeEnd) {
+                const rows = await prisma.$queryRaw<
+                  Array<{ cnt: bigint | number }>
+                >`
+                  SELECT COUNT(DISTINCT bp.INTERPRETER_EMP_CODE) AS cnt
+                  FROM BOOKING_PLAN bp
+                  JOIN ENVIRONMENT_INTERPRETER ei ON ei.INTERPRETER_EMP_CODE = bp.INTERPRETER_EMP_CODE AND ei.ENVIRONMENT_ID = ${environmentId}
+                  WHERE bp.INTERPRETER_EMP_CODE IS NOT NULL
+                    AND bp.BOOKING_STATUS IN ('approve','waiting')
+                    AND (bp.TIME_START < ${bk.timeEnd} AND bp.TIME_END > ${bk.timeStart})
+                `;
+                const busy = rows?.[0]?.cnt != null ? Number(rows[0].cnt) : 0;
+                const total = await prisma.environmentInterpreter.count({
+                  where: { environmentId },
+                });
+                capacityFull = total <= 0 ? true : total - busy <= 0;
+              }
+
+              const suggestion = {
+                eligible: capacityFull,
+                capacityFull,
+                urgent: false,
+                environmentId,
+              };
+
+              // Do not auto-forward here. UI will decide. Only return suggestion.
+              (
+                result.body.data as unknown as Record<string, unknown>
+              ).forwardSuggestion = suggestion;
+            } catch (e) {
+              console.warn("Forward suggestion computation failed", e);
+            }
+          }
         }
       } catch (error) {
         console.error("❌ Auto-assignment failed:", error);
@@ -1143,16 +1243,20 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("Error creating booking:", error);
+    console.error("Error details:", {
+      message: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : undefined,
+    });
     return NextResponse.json(
       {
         success: false,
         error: "Internal server error",
         message: "An unexpected error occurred while creating the booking",
+        details: error instanceof Error ? error.message : "Unknown error",
       },
       { status: 500 }
     );
-  } finally {
-    await prisma.$disconnect();
   }
 }
 
@@ -1193,7 +1297,5 @@ export async function GET(request: NextRequest) {
       },
       { status: 500 }
     );
-  } finally {
-    await prisma.$disconnect();
   }
 }

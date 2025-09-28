@@ -143,7 +143,7 @@ export async function createDefaultMeetingTypePriorities(): Promise<void> {
     { meetingType: 'VIP' as const, priorityValue: 4, urgentThresholdDays: 2, generalThresholdDays: 14 },
     { meetingType: 'Weekly' as const, priorityValue: 3, urgentThresholdDays: 3, generalThresholdDays: 30 },
     { meetingType: 'General' as const, priorityValue: 2, urgentThresholdDays: 3, generalThresholdDays: 30 },
-    { meetingType: 'Augent' as const, priorityValue: 2, urgentThresholdDays: 3, generalThresholdDays: 30 },
+    { meetingType: 'Urgent' as const, priorityValue: 2, urgentThresholdDays: 3, generalThresholdDays: 30 },
     { meetingType: 'Other' as const, priorityValue: 1, urgentThresholdDays: 5, generalThresholdDays: 45 }
   ];
 
@@ -167,8 +167,10 @@ export async function createDefaultMeetingTypePriorities(): Promise<void> {
  */
   export async function getMeetingTypePriority(meetingType: string): Promise<MeetingTypePriority | null> {
   try {
-    const priority = await prisma.meetingTypePriority.findUnique({
-      where: { meetingType: meetingType as "DR" | "VIP" | "Weekly" | "General" | "Augent" | "Other" }
+    // Fallback to global priority (environmentId null) in the new composite-unique world
+    const priority = await prisma.meetingTypePriority.findFirst({
+      where: { meetingType: meetingType as any, environmentId: null },
+      orderBy: { updatedAt: 'desc' }
     });
     return priority;
   } catch (error) {
@@ -265,7 +267,7 @@ export async function updateMeetingTypePriority(
 ): Promise<MeetingTypePriority> {
   try {
     const updated = await prisma.meetingTypePriority.update({
-      where: { meetingType: meetingType as "DR" | "VIP" | "Weekly" | "General" | "Augent" | "Other" },
+      where: { meetingType: meetingType as "DR" | "VIP" | "Weekly" | "General" | "Urgent" | "Other" },
       data: priority
     });
     return updated;
