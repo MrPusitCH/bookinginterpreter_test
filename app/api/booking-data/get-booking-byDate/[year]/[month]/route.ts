@@ -9,7 +9,7 @@ export const runtime = "nodejs";
 
 export async function GET(
   request: Request,
-  context: { params: { year: string; month: string } }
+  context: { params: Promise<{ year: string; month: string }> }
 ) {
   const { year, month } = await context.params;
 
@@ -28,8 +28,14 @@ export async function GET(
     });
   }
 
-  const startDate = new Date(yearNum, monthNum - 1, 1);
-  const endDate = new Date(yearNum, monthNum, 0, 23, 59, 59);
+  // Keep API session in UTC so Prisma Dates are true UTC
+  try {
+    await prisma.$executeRaw`SET time_zone = '+00:00'`;
+  } catch {}
+
+  // Use UTC month boundaries to match UTC storage
+  const startDate = new Date(Date.UTC(yearNum, monthNum - 1, 1, 0, 0, 0));
+  const endDate = new Date(Date.UTC(yearNum, monthNum, 0, 23, 59, 59));
 
   const bookings = await prisma.bookingPlan.findMany({
     where: {
@@ -55,10 +61,11 @@ export async function GET(
         select: { firstNameEn: true, lastNameEn: true, email: true, telExt: true, deptPath: true },
       },
       interpreterEmployee: {
-        select: { empCode: true,
-                firstNameEn: true,
-                lastNameEn: true,
-                                                  },
+        select: {
+          empCode: true,
+          firstNameEn: true,
+          lastNameEn: true,
+        },
       },
     },
   });
@@ -79,7 +86,12 @@ export async function GET(
       include: { userRoles: true },
     });
     if (me) {
-      roles = (me.userRoles ?? []).map(r => r.roleCode);
+      // Get user roles
+      const userRoles = await prisma.userRole.findMany({
+        where: { userId: me.id },
+      });
+      roles = userRoles.map(r => r.roleCode);
+
       myCenter = centerPart(me.deptPath);
       // Admin environments → union of centers
       if (roles.includes('ADMIN') || roles.includes('SUPER_ADMIN')) {
@@ -101,8 +113,8 @@ export async function GET(
   }
   const hasAdmin = roles.includes('ADMIN') || roles.includes('SUPER_ADMIN');
   const isSuper = roles.includes('SUPER_ADMIN');
-  const view: 'user'|'admin'|'all' = viewRaw === 'user' || viewRaw === 'admin' || viewRaw === 'all'
-    ? (viewRaw as 'user'|'admin'|'all')
+  const view: 'user' | 'admin' | 'all' = viewRaw === 'user' || viewRaw === 'admin' || viewRaw === 'all'
+    ? (viewRaw as 'user' | 'admin' | 'all')
     : (hasAdmin ? 'admin' : 'user');
 
   // Build interpreter-based environment sets
@@ -170,7 +182,8 @@ export async function GET(
 
   const asOwnerGroup = (v: unknown): OwnerGroupUI => {
     const s = String(v || "").toLowerCase();
-    if (s === "software" || s === "iot" || s === "hardware" || s === "other") return s as OwnerGroupUI;
+    if (s === "software" || s === "iot" || s === "hardware" || s === "other")
+      return s as OwnerGroupUI;
     return "other";
   };
 
@@ -188,7 +201,7 @@ export async function GET(
     updatedAt: Date;
     employee?: { firstNameEn: string | null; lastNameEn: string | null; email: string | null; telExt: string | null; deptPath?: string | null } | null;
     interpreterEmployee?: { empCode: string | null; firstNameEn: string | null; lastNameEn: string | null } | null;
-    
+
   }>).map((b) => ({
     bookingId: b.bookingId,
     ownerEmpCode: b.ownerEmpCode,
@@ -201,15 +214,17 @@ export async function GET(
     meetingDetail: b.meetingDetail ?? "",
     meetingType: b.meetingType,
     // highPriority removed from API response
-    timeStart: formatDateTime(b.timeStart),
-    timeEnd: formatDateTime(b.timeEnd),
+    timeStart: b.timeStart.toISOString(),
+    timeEnd: b.timeEnd.toISOString(),
     interpreterId: b.interpreterEmployee?.empCode ?? null,
     interpreterName: b.interpreterEmployee
-    ?`${b.interpreterEmployee.firstNameEn ?? ""} ${b.interpreterEmployee.lastNameEn ?? ""}`.trim()  
-    : "",
+      ? `${b.interpreterEmployee.firstNameEn ?? ""} ${
+          b.interpreterEmployee.lastNameEn ?? ""
+        }`.trim()
+      : "",
     bookingStatus: b.bookingStatus,
-    createdAt: formatDateTime(b.createdAt),
-    updatedAt: formatDateTime(b.updatedAt),
+    createdAt: b.createdAt.toISOString(),
+    updatedAt: b.updatedAt.toISOString(),
   }));
 
   return new Response(JSON.stringify(result), {
